@@ -24,6 +24,7 @@ export async function GET(_request: Request, { params }: Params) {
     totalChunks: number;
     completedChunks: number;
     outputName: string | null;
+    metadataName: string | null;
     error: string | null;
   };
 
@@ -32,6 +33,10 @@ export async function GET(_request: Request, { params }: Params) {
     audioUrl:
       job.status === "complete" && job.outputName
         ? `/api/tts/audio/${job.outputName}`
+        : null,
+    metadataUrl:
+      job.status === "complete" && job.metadataName
+        ? `/api/tts/metadata/${job.metadataName}`
         : null,
   });
 }

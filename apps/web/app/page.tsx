@@ -1,13 +1,24 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const DEFAULT_TEXT =
   "Hello Nick. This is your local AI lab reading pasted text with a cloned voice.";
 
+const FONT_SIZE_CLASSES = {
+  base: "text-base",
+  lg: "text-lg",
+  xl: "text-xl",
+  "2xl": "text-2xl",
+  "3xl": "text-3xl",
+} as const;
+
+type FontSize = keyof typeof FONT_SIZE_CLASSES;
+
 type Clip = {
   name: string;
   url: string;
+  metadataUrl: string;
 };
 
 type JobStatus = {
@@ -15,8 +26,25 @@ type JobStatus = {
   totalChunks: number;
   completedChunks: number;
   outputName: string | null;
-  audioUrl?: string;
+  metadataName: string | null;
+  audioUrl?: string | null;
+  metadataUrl?: string | null;
   error: string | null;
+};
+
+type ClipMetadata = {
+  title: string;
+  text: string;
+  voice: string;
+  language: string;
+  audioFile: string;
+  createdAt: string;
+};
+
+type SentenceTiming = {
+  sentence: string;
+  start: number;
+  end: number;
 };
 
 function formatClipName(fileName: string) {
@@ -39,14 +67,63 @@ function formatTime(seconds: number) {
   return `${minutes}m ${remainingSeconds}s remaining`;
 }
 
+function splitIntoSentences(value: string) {
+  return (
+    value
+      .replace(/\s+/g, " ")
+      .trim()
+      .match(/[^.!?]+[.!?]+["')\]]*|[^.!?]+$/g)
+      ?.map((sentence) => sentence.trim())
+      .filter(Boolean) ?? []
+  );
+}
+
+function buildEstimatedSentenceTimings(
+  sentences: string[],
+  duration: number,
+): SentenceTiming[] {
+  if (duration <= 0 || sentences.length === 0) {
+    return [];
+  }
+
+  const totalWeight = sentences.reduce(
+    (sum, sentence) => sum + Math.max(sentence.length, 1),
+    0,
+  );
+
+  let cursor = 0;
+
+  return sentences.map((sentence, index) => {
+    const isLast = index === sentences.length - 1;
+    const weight = Math.max(sentence.length, 1);
+    const sentenceDuration = isLast
+      ? duration - cursor
+      : (weight / totalWeight) * duration;
+
+    const timing = {
+      sentence,
+      start: cursor,
+      end: isLast ? duration : cursor + sentenceDuration,
+    };
+
+    cursor = timing.end;
+
+    return timing;
+  });
+}
+
 export default function Home() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const pollIntervalRef = useRef<number | null>(null);
 
   const [title, setTitle] = useState("");
   const [text, setText] = useState(DEFAULT_TEXT);
+  const [readerText, setReaderText] = useState(DEFAULT_TEXT);
   const [audioUrl, setAudioUrl] = useState("");
   const [speed, setSpeed] = useState(2);
+  const [fontSize, setFontSize] = useState<FontSize>("xl");
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
   const [isGenerating, setIsGenerating] = useState(false);
   const [progress, setProgress] = useState<JobStatus | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
@@ -54,17 +131,54 @@ export default function Home() {
   const [currentJobId, setCurrentJobId] = useState("");
   const [startedAt, setStartedAt] = useState<number | null>(null);
 
+  const sentences = useMemo(() => splitIntoSentences(readerText), [readerText]);
+
+  const sentenceTimings = useMemo(
+    () => buildEstimatedSentenceTimings(sentences, duration),
+    [sentences, duration],
+  );
+
+  const activeSentenceIndex = sentenceTimings.findIndex(
+    (timing) => currentTime >= timing.start && currentTime < timing.end,
+  );
+
   async function loadClips() {
     const response = await fetch("/api/tts/clips");
     const data = (await response.json()) as { clips: Clip[] };
     setClips(data.clips);
   }
 
+  async function loadMetadata(metadataUrl: string) {
+    try {
+      const response = await fetch(metadataUrl, { cache: "no-store" });
+
+      if (!response.ok) {
+        throw new Error("Metadata not found.");
+      }
+
+      const metadata = (await response.json()) as ClipMetadata;
+
+      setReaderText(metadata.text);
+    } catch {
+      setReaderText(
+        "No saved transcript metadata was found for this clip. Generate it again to create read-along metadata.",
+      );
+    }
+  }
+
   useEffect(() => {
     const savedSpeed = window.localStorage.getItem("tts-playback-speed");
+    const savedFontSize = window.localStorage.getItem("tts-reader-font-size");
 
     if (savedSpeed) {
       setSpeed(Number(savedSpeed));
+    }
+
+    if (
+      savedFontSize &&
+      Object.keys(FONT_SIZE_CLASSES).includes(savedFontSize)
+    ) {
+      setFontSize(savedFontSize as FontSize);
     }
 
     void loadClips();
@@ -81,6 +195,9 @@ export default function Home() {
     setError("");
     setProgress(null);
     setStartedAt(Date.now());
+    setReaderText(text);
+    setCurrentTime(0);
+    setDuration(0);
 
     try {
       const response = await fetch("/api/tts", {
@@ -126,6 +243,11 @@ export default function Home() {
           setAudioUrl(data.audioUrl);
           setIsGenerating(false);
           setCurrentJobId("");
+
+          if (data.metadataUrl) {
+            await loadMetadata(data.metadataUrl);
+          }
+
           await loadClips();
 
           setTimeout(() => {
@@ -201,8 +323,21 @@ export default function Home() {
     }
   }
 
-  function selectClip(url: string) {
-    setAudioUrl(url);
+  function updateFontSize(nextFontSize: FontSize) {
+    setFontSize(nextFontSize);
+    window.localStorage.setItem("tts-reader-font-size", nextFontSize);
+  }
+
+  function selectClip(selectedAudioUrl: string) {
+    const selectedClip = clips.find((clip) => clip.url === selectedAudioUrl);
+
+    setAudioUrl(selectedAudioUrl);
+    setCurrentTime(0);
+    setDuration(0);
+
+    if (selectedClip) {
+      void loadMetadata(selectedClip.metadataUrl);
+    }
 
     setTimeout(() => {
       if (audioRef.current) {
@@ -239,7 +374,7 @@ export default function Home() {
           <label className="flex flex-col gap-2">
             <span className="font-medium">Title</span>
             <input
-              className="rounded-lg border p-3 disabled:opacity-60"
+              className="rounded-lg border bg-black p-3 text-white disabled:opacity-60"
               disabled={isGenerating}
               placeholder="Example: House Drakan Foreword"
               value={title}
@@ -250,7 +385,7 @@ export default function Home() {
           <label className="flex flex-col gap-2">
             <span className="font-medium">Text</span>
             <textarea
-              className="min-h-96 w-full rounded-lg border p-4 text-base disabled:opacity-60"
+              className="min-h-96 w-full rounded-lg border bg-black p-4 text-base text-white disabled:opacity-60"
               disabled={isGenerating}
               value={text}
               onChange={(event) => setText(event.target.value)}
@@ -278,7 +413,7 @@ export default function Home() {
             <label className="flex items-center gap-2">
               Speed
               <select
-                className="rounded border px-2 py-1"
+                className="rounded border bg-black px-2 py-1 text-white"
                 value={speed}
                 onChange={(event) => updateSpeed(Number(event.target.value))}
               >
@@ -319,7 +454,7 @@ export default function Home() {
           <h2 className="text-xl font-semibold">Saved clips</h2>
 
           <select
-            className="rounded border p-2"
+            className="rounded border bg-black p-2 text-white"
             value={audioUrl}
             onChange={(event) => selectClip(event.target.value)}
           >
@@ -338,8 +473,21 @@ export default function Home() {
       </section>
 
       {audioUrl ? (
-        <section className="flex flex-col gap-3 rounded-lg border p-4">
-          <audio ref={audioRef} controls preload="metadata">
+        <section className="flex flex-col gap-4 rounded-lg border p-4">
+          <audio
+            ref={audioRef}
+            controls
+            preload="metadata"
+            onDurationChange={(event) =>
+              setDuration(event.currentTarget.duration || 0)
+            }
+            onLoadedMetadata={(event) =>
+              setDuration(event.currentTarget.duration || 0)
+            }
+            onTimeUpdate={(event) =>
+              setCurrentTime(event.currentTarget.currentTime)
+            }
+          >
             <source src={audioUrl} type="audio/wav" />
           </audio>
 
@@ -354,6 +502,53 @@ export default function Home() {
               </button>
             ))}
           </div>
+
+          <section className="rounded-lg border p-4">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-xl font-semibold">Read along</h2>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm opacity-70">Text size</span>
+                {(Object.keys(FONT_SIZE_CLASSES) as FontSize[]).map((size) => (
+                  <button
+                    className={`rounded border px-2 py-1 ${
+                      fontSize === size ? "bg-black text-white" : ""
+                    }`}
+                    key={size}
+                    onClick={() => updateFontSize(size)}
+                  >
+                    {size}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div
+              className={`max-h-[32rem] overflow-y-auto rounded-lg bg-neutral-950 p-5 leading-relaxed text-white ${FONT_SIZE_CLASSES[fontSize]}`}
+            >
+              {sentenceTimings.length > 0 ? (
+                sentenceTimings.map((timing, index) => (
+                  <span
+                    className={
+                      index === activeSentenceIndex
+                        ? "rounded bg-yellow-300 px-1 text-black"
+                        : "opacity-75"
+                    }
+                    key={`${timing.start}-${timing.sentence}`}
+                  >
+                    {timing.sentence}{" "}
+                  </span>
+                ))
+              ) : (
+                <p className="opacity-75">{readerText}</p>
+              )}
+            </div>
+
+            <p className="mt-3 text-sm opacity-60">
+              Highlighting is estimated from saved source text and audio
+              duration.
+            </p>
+          </section>
         </section>
       ) : null}
 

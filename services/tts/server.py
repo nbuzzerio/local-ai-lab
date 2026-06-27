@@ -1,5 +1,7 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+import json
 import re
 import threading
 
@@ -84,14 +86,40 @@ def split_text(text: str, max_chars: int = 220) -> list[str]:
     return chunks
 
 
+def write_metadata(
+    metadata_path: Path,
+    *,
+    title: str,
+    text: str,
+    voice: str,
+    language: str,
+    output_name: str,
+):
+    metadata = {
+        "title": title,
+        "text": text,
+        "voice": voice,
+        "language": language,
+        "audioFile": output_name,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def generate_job(job_id: str, payload: SpeakRequest):
     try:
         OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
         chunks = split_text(payload.text)
         output_name = f"{slugify(payload.title)}-{uuid4().hex[:8]}.wav"
+        metadata_name = output_name.replace(".wav", ".json")
         voice_path = VOICES_DIR / payload.voice
         output_path = OUTPUTS_DIR / output_name
+        metadata_path = OUTPUTS_DIR / metadata_name
 
         jobs[job_id].update(
             {
@@ -99,6 +127,7 @@ def generate_job(job_id: str, payload: SpeakRequest):
                 "totalChunks": len(chunks),
                 "completedChunks": 0,
                 "outputName": output_name,
+                "metadataName": metadata_name,
                 "error": None,
             }
         )
@@ -140,6 +169,15 @@ def generate_job(job_id: str, payload: SpeakRequest):
             SAMPLE_RATE,
         )
 
+        write_metadata(
+            metadata_path,
+            title=payload.title,
+            text=payload.text,
+            voice=payload.voice,
+            language=payload.language,
+            output_name=output_name,
+        )
+
         jobs[job_id]["status"] = "complete"
 
     except Exception as error:
@@ -166,6 +204,7 @@ def speak(payload: SpeakRequest):
         "totalChunks": 0,
         "completedChunks": 0,
         "outputName": None,
+        "metadataName": None,
         "error": None,
     }
 
