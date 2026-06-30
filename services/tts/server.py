@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue
 from uuid import uuid4
 import json
 import re
@@ -17,9 +18,11 @@ MODEL_DIR = BASE_DIR / "models" / "xtts_v2"
 VOICES_DIR = BASE_DIR / "voices"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 SAMPLE_RATE = 24000
+CHUNK_SILENCE_SECONDS = 0.25
 
 app = FastAPI()
 jobs = {}
+job_queue: Queue[tuple[str, "SpeakRequest"]] = Queue()
 
 print("Loading XTTS config...")
 config = XttsConfig()
@@ -45,45 +48,107 @@ def slugify(value: str) -> str:
     return slug[:60] or "untitled"
 
 
-def split_text(text: str, max_chars: int = 220) -> list[str]:
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    chunks: list[str] = []
-    current = ""
+def is_valid_voice_name(voice: str) -> bool:
+    return voice.endswith(".wav") and "/" not in voice and "\\" not in voice
+
+
+def list_voices() -> list[str]:
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+
+    return sorted(
+        [file.name for file in VOICES_DIR.glob("*.wav")],
+        key=str.lower,
+    )
+
+
+def split_into_sentences(text: str) -> list[str]:
+    return (
+        re.findall(r'[^.!?]+[.!?]+["\')\]]*|[^.!?]+$', text.replace("\n", " ").strip())
+        or []
+    )
+
+
+def split_text_into_chunks(text: str, max_chars: int = 220) -> list[list[str]]:
+    sentences = [sentence.strip() for sentence in split_into_sentences(text) if sentence.strip()]
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_length = 0
 
     for sentence in sentences:
-        if not sentence:
-            continue
-
         if len(sentence) > max_chars:
             if current:
-                chunks.append(current.strip())
-                current = ""
+                chunks.append(current)
+                current = []
+                current_length = 0
 
             words = sentence.split()
             part = ""
 
             for word in words:
                 if len(part) + len(word) + 1 > max_chars:
-                    chunks.append(part.strip())
+                    chunks.append([part.strip()])
                     part = word
                 else:
                     part = f"{part} {word}".strip()
 
             if part:
-                chunks.append(part.strip())
+                chunks.append([part.strip()])
 
             continue
 
-        if len(current) + len(sentence) + 1 <= max_chars:
-            current = f"{current} {sentence}".strip()
+        next_length = current_length + len(sentence) + (1 if current else 0)
+
+        if next_length <= max_chars:
+            current.append(sentence)
+            current_length = next_length
         else:
-            chunks.append(current.strip())
-            current = sentence
+            chunks.append(current)
+            current = [sentence]
+            current_length = len(sentence)
 
     if current:
-        chunks.append(current.strip())
+        chunks.append(current)
 
     return chunks
+
+
+def create_sentence_segments(
+    *,
+    chunk_sentences: list[str],
+    chunk_start: float,
+    chunk_duration: float,
+) -> list[dict]:
+    total_weight = sum(max(len(sentence), 1) for sentence in chunk_sentences)
+
+    if total_weight <= 0 or chunk_duration <= 0:
+        return []
+
+    cursor = chunk_start
+    segments = []
+
+    for index, sentence in enumerate(chunk_sentences):
+        is_last = index == len(chunk_sentences) - 1
+        weight = max(len(sentence), 1)
+        sentence_duration = (
+            chunk_start + chunk_duration - cursor
+            if is_last
+            else (weight / total_weight) * chunk_duration
+        )
+
+        start = cursor
+        end = chunk_start + chunk_duration if is_last else cursor + sentence_duration
+
+        segments.append(
+            {
+                "text": sentence,
+                "start": round(start, 3),
+                "end": round(end, 3),
+            }
+        )
+
+        cursor = end
+
+    return segments
 
 
 def write_metadata(
@@ -94,6 +159,7 @@ def write_metadata(
     voice: str,
     language: str,
     output_name: str,
+    segments: list[dict],
 ):
     metadata = {
         "title": title,
@@ -102,6 +168,7 @@ def write_metadata(
         "language": language,
         "audioFile": output_name,
         "createdAt": datetime.now(timezone.utc).isoformat(),
+        "segments": segments,
     }
 
     metadata_path.write_text(
@@ -114,10 +181,20 @@ def generate_job(job_id: str, payload: SpeakRequest):
     try:
         OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-        chunks = split_text(payload.text)
+        if jobs[job_id]["status"] == "cancelled":
+            return
+
+        if not is_valid_voice_name(payload.voice):
+            raise ValueError("Invalid voice file name.")
+
+        voice_path = VOICES_DIR / payload.voice
+
+        if not voice_path.exists():
+            raise ValueError(f"Voice not found: {payload.voice}")
+
+        chunks = split_text_into_chunks(payload.text)
         output_name = f"{slugify(payload.title)}-{uuid4().hex[:8]}.wav"
         metadata_name = output_name.replace(".wav", ".json")
-        voice_path = VOICES_DIR / payload.voice
         output_path = OUTPUTS_DIR / output_name
         metadata_path = OUTPUTS_DIR / metadata_name
 
@@ -137,24 +214,43 @@ def generate_job(job_id: str, payload: SpeakRequest):
         )
 
         wav_chunks = []
+        segments = []
+        audio_cursor = 0.0
 
-        for index, chunk in enumerate(chunks, start=1):
+        for index, chunk_sentences in enumerate(chunks, start=1):
             if jobs[job_id]["status"] == "cancelled":
                 return
+
+            chunk_text = " ".join(chunk_sentences)
 
             print(f"Generating chunk {index}/{len(chunks)}...")
 
             out = model.inference(
-                chunk,
+                chunk_text,
                 payload.language,
                 gpt_cond_latent,
                 speaker_embedding,
             )
 
-            wav_chunks.append(torch.tensor(out["wav"]))
+            chunk_wav = torch.tensor(out["wav"])
+            chunk_duration = len(chunk_wav) / SAMPLE_RATE
+
+            wav_chunks.append(chunk_wav)
+
+            segments.extend(
+                create_sentence_segments(
+                    chunk_sentences=chunk_sentences,
+                    chunk_start=audio_cursor,
+                    chunk_duration=chunk_duration,
+                )
+            )
+
+            audio_cursor += chunk_duration
 
             if index < len(chunks):
-                wav_chunks.append(torch.zeros(int(SAMPLE_RATE * 0.25)))
+                silence = torch.zeros(int(SAMPLE_RATE * CHUNK_SILENCE_SECONDS))
+                wav_chunks.append(silence)
+                audio_cursor += CHUNK_SILENCE_SECONDS
 
             jobs[job_id]["completedChunks"] = index
 
@@ -176,6 +272,7 @@ def generate_job(job_id: str, payload: SpeakRequest):
             voice=payload.voice,
             language=payload.language,
             output_name=output_name,
+            segments=segments,
         )
 
         jobs[job_id]["status"] = "complete"
@@ -185,9 +282,29 @@ def generate_job(job_id: str, payload: SpeakRequest):
         jobs[job_id]["error"] = str(error)
 
 
+def job_worker():
+    while True:
+        job_id, payload = job_queue.get()
+
+        try:
+            if jobs[job_id]["status"] != "cancelled":
+                generate_job(job_id, payload)
+        finally:
+            job_queue.task_done()
+
+
+worker_thread = threading.Thread(target=job_worker, daemon=True)
+worker_thread.start()
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/voices")
+def voices():
+    return {"voices": list_voices()}
 
 
 @app.post("/speak")
@@ -197,6 +314,12 @@ def speak(payload: SpeakRequest):
 
     if not payload.title.strip():
         raise HTTPException(status_code=400, detail="Title is required.")
+
+    if not is_valid_voice_name(payload.voice):
+        raise HTTPException(status_code=400, detail="Invalid voice file name.")
+
+    if payload.voice not in list_voices():
+        raise HTTPException(status_code=400, detail="Voice not found.")
 
     job_id = uuid4().hex
     jobs[job_id] = {
@@ -208,8 +331,7 @@ def speak(payload: SpeakRequest):
         "error": None,
     }
 
-    thread = threading.Thread(target=generate_job, args=(job_id, payload), daemon=True)
-    thread.start()
+    job_queue.put((job_id, payload))
 
     return {"jobId": job_id}
 

@@ -21,6 +21,11 @@ type Clip = {
   metadataUrl: string;
 };
 
+type Voice = {
+  name: string;
+  label: string;
+};
+
 type JobStatus = {
   status: "queued" | "running" | "complete" | "error" | "cancelled";
   totalChunks: number;
@@ -39,10 +44,11 @@ type ClipMetadata = {
   language: string;
   audioFile: string;
   createdAt: string;
+  segments?: SentenceTiming[];
 };
 
 type SentenceTiming = {
-  sentence: string;
+  text: string;
   start: number;
   end: number;
 };
@@ -101,7 +107,7 @@ function buildEstimatedSentenceTimings(
       : (weight / totalWeight) * duration;
 
     const timing = {
-      sentence,
+      text: sentence,
       start: cursor,
       end: isLast ? duration : cursor + sentenceDuration,
     };
@@ -124,19 +130,25 @@ export default function Home() {
   const [fontSize, setFontSize] = useState<FontSize>("xl");
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [segments, setSegments] = useState<SentenceTiming[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [progress, setProgress] = useState<JobStatus | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
+  const [voices, setVoices] = useState<Voice[]>([]);
+  const [selectedVoice, setSelectedVoice] = useState("nova.wav");
   const [error, setError] = useState("");
   const [currentJobId, setCurrentJobId] = useState("");
   const [startedAt, setStartedAt] = useState<number | null>(null);
 
   const sentences = useMemo(() => splitIntoSentences(readerText), [readerText]);
 
-  const sentenceTimings = useMemo(
-    () => buildEstimatedSentenceTimings(sentences, duration),
-    [sentences, duration],
-  );
+  const sentenceTimings = useMemo(() => {
+    if (segments.length > 0) {
+      return segments;
+    }
+
+    return buildEstimatedSentenceTimings(sentences, duration);
+  }, [segments, sentences, duration]);
 
   const activeSentenceIndex = sentenceTimings.findIndex(
     (timing) => currentTime >= timing.start && currentTime < timing.end,
@@ -146,6 +158,21 @@ export default function Home() {
     const response = await fetch("/api/tts/clips");
     const data = (await response.json()) as { clips: Clip[] };
     setClips(data.clips);
+  }
+
+  async function loadVoices() {
+    const response = await fetch("/api/tts/voices");
+    const data = (await response.json()) as { voices: Voice[] };
+
+    setVoices(data.voices);
+
+    if (data.voices.length > 0) {
+      setSelectedVoice((current) =>
+        data.voices.some((voice) => voice.name === current)
+          ? current
+          : data.voices[0].name,
+      );
+    }
   }
 
   async function loadMetadata(metadataUrl: string) {
@@ -159,6 +186,7 @@ export default function Home() {
       const metadata = (await response.json()) as ClipMetadata;
 
       setReaderText(metadata.text);
+      setSegments(metadata.segments ?? []);
     } catch {
       setReaderText(
         "No saved transcript metadata was found for this clip. Generate it again to create read-along metadata.",
@@ -182,6 +210,7 @@ export default function Home() {
     }
 
     void loadClips();
+    void loadVoices();
 
     return () => {
       if (pollIntervalRef.current) {
@@ -198,12 +227,13 @@ export default function Home() {
     setReaderText(text);
     setCurrentTime(0);
     setDuration(0);
+    setSegments([]);
 
     try {
       const response = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, title }),
+        body: JSON.stringify({ text, title, voice: selectedVoice }),
       });
 
       const data = (await response.json()) as {
@@ -334,6 +364,7 @@ export default function Home() {
     setAudioUrl(selectedAudioUrl);
     setCurrentTime(0);
     setDuration(0);
+    setSegments([]);
 
     if (selectedClip) {
       void loadMetadata(selectedClip.metadataUrl);
@@ -376,7 +407,7 @@ export default function Home() {
             <input
               className="rounded-lg border bg-black p-3 text-white disabled:opacity-60"
               disabled={isGenerating}
-              placeholder="Example: House Drakan Foreword"
+              placeholder=""
               value={title}
               onChange={(event) => setTitle(event.target.value)}
             />
@@ -422,6 +453,25 @@ export default function Home() {
                     {value}x
                   </option>
                 ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-2">
+              Voice
+              <select
+                className="rounded border bg-black px-2 py-1 text-white"
+                disabled={isGenerating || voices.length === 0}
+                value={selectedVoice}
+                onChange={(event) => setSelectedVoice(event.target.value)}
+              >
+                {voices.length === 0 ? (
+                  <option value="nova.wav">No voices found</option>
+                ) : (
+                  voices.map((voice) => (
+                    <option key={voice.name} value={voice.name}>
+                      {voice.label}
+                    </option>
+                  ))
+                )}
               </select>
             </label>
           </div>
@@ -524,7 +574,7 @@ export default function Home() {
             </div>
 
             <div
-              className={`max-h-[32rem] overflow-y-auto rounded-lg bg-neutral-950 p-5 leading-relaxed text-white ${FONT_SIZE_CLASSES[fontSize]}`}
+              className={`max-h-128 overflow-y-auto rounded-lg bg-neutral-950 p-5 leading-relaxed text-white ${FONT_SIZE_CLASSES[fontSize]}`}
             >
               {sentenceTimings.length > 0 ? (
                 sentenceTimings.map((timing, index) => (
@@ -534,9 +584,9 @@ export default function Home() {
                         ? "rounded bg-yellow-300 px-1 text-black"
                         : "opacity-75"
                     }
-                    key={`${timing.start}-${timing.sentence}`}
+                    key={`${timing.start}-${timing.text}`}
                   >
-                    {timing.sentence}{" "}
+                    {timing.text}{" "}
                   </span>
                 ))
               ) : (
